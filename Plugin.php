@@ -48,6 +48,31 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
         // 添加Author字段
         $author = new Typecho_Widget_Helper_Form_Element_Text('author', NULL, '', _t('作者'), _t('请填写文章作者，默认使用个人资料中的昵称，长度不得超过8个汉字</br> 如要更改封面图片，请在公众平台上传图片后点击<a href="' . Helper::options()->index . '/reset_mediaid">重置封面缓存</a>，后续使用时会自动获取新的图片'));
         $form->addInput($author);
+
+        // 同步策略：默认是 opt-in（"按需触发"），勾选后改为 opt-out（"按需排除"）
+        $autoSyncDefault = new Typecho_Widget_Helper_Form_Element_Checkbox(
+            'autoSyncDefault',
+            ['enable' => _t('默认对所有手动发文自动同步到公众号草稿')],
+            [],
+            _t('默认同步策略'),
+            _t('不勾选（默认）：手动发文不会自动同步，需在文章正文加 <code>&lt;!--wechat--&gt;</code> 注释、'
+              . '或文章带「同步关键词」对应的标签/分类，才会触发同步。<br>'
+              . '勾选后：所有手动发文都会自动同步，除非用上述任一标记主动排除（注释改为 <code>&lt;!--no-wechat--&gt;</code>，'
+              . '标签/分类名加 <code>no-</code> 前缀，如 <code>no-wechat</code>）。<br>'
+              . '注意：其他插件通过 API 调用 <code>syncDraft()</code> 不受此开关影响。')
+        );
+        $form->addInput($autoSyncDefault);
+
+        // 同步关键词（注释 / 标签 / 分类名都用它）
+        $syncTriggerKeyword = new Typecho_Widget_Helper_Form_Element_Text(
+            'syncTriggerKeyword', NULL, 'wechat',
+            _t('同步关键词'),
+            _t('用于注释标记和标签/分类名匹配。默认 <code>wechat</code>，即：<br>'
+              . '• 正文含 <code>&lt;!--wechat--&gt;</code>（opt-in 模式）/ <code>&lt;!--no-wechat--&gt;</code>（opt-out 模式）<br>'
+              . '• 文章有名为 <code>wechat</code> / <code>no-wechat</code> 的标签或分类<br>'
+              . '换成 <code>mp</code> 之类的也行，但需重启所有相关文章中的标签/注释一并改名。')
+        );
+        $form->addInput($syncTriggerKeyword);
     }
 
     /* 个人用户的配置方法 */
@@ -129,7 +154,13 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
         return $mediaId;
 
     }
-    /* 上传图片到素材库 */
+    /* 上传图片到素材库
+     *
+     * 微信 media/uploadimg 接口要的是 multipart 文件，CURLFile 在大多数 PHP 环境下
+     * 不接受 http(s) URL —— 远程图片必须先下载到本地临时文件。
+     *
+     * 单张图片失败时跳过、保留原 src，让其他图片继续上传，整体不中断。
+     */
     public static function uploadImageToWeChat($html){
         $accessToken = self::getAccessToken();
         $url = 'https://api.weixin.qq.com/cgi-bin/media/uploadimg?access_token='.$accessToken;
@@ -140,22 +171,75 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
 
         foreach ($images as $image) {
             // 提取 <img> 标签中的 src 属性值
-            preg_match('/src="([^"]+)"/i', $image, $srcMatches);
+            if (!preg_match('/src="([^"]+)"/i', $image, $srcMatches)) {
+                continue;
+            }
             $src = $srcMatches[1];
 
-            // 上传图片文件
-            $res = self::curl($url,'',true,$src);
+            // 远程 URL 先落盘到 tmp，本地路径直接用
+            $tmpFile = null;
+            $uploadPath = $src;
+            if (preg_match('#^https?://#i', $src)) {
+                $tmpFile = self::downloadToTemp($src);
+                if ($tmpFile === false) {
+                    continue; // 下载失败，跳过这张图，保留原 src
+                }
+                $uploadPath = $tmpFile;
+            }
 
-            // 获取上传后的图片 URL
-            $wxImageUrl = $res->url;
+            try {
+                $res = self::curl($url, '', true, $uploadPath);
+                if (isset($res->url)) {
+                    $html = str_replace($src, $res->url, $html);
+                }
+            } catch (Exception $e) {
+                // 单张图片上传失败不影响其他图片和草稿同步整体
+            }
 
-            // 替换 HTML 中的图片标签中的 src 属性为上传后的图片 URL
-            $html = str_replace($src, $wxImageUrl, $html);
-            // 修复bug，替换HTML中的#为\#
-            $html = str_replace('#', '\#', $html);
+            if ($tmpFile !== null) {
+                @unlink($tmpFile);
+            }
         }
 
         return $html;
+    }
+
+    /**
+     * 下载远程图片到临时文件
+     *
+     * 用 curl 抓取（比 file_get_contents 兼容性好，且能绕过 allow_url_fopen 限制）。
+     * 返回 tmp 路径，调用方负责 unlink。失败返回 false。
+     *
+     * @param string $url
+     * @return string|false
+     */
+    private static function downloadToTemp($url)
+    {
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        curl_setopt($ch, CURLOPT_USERAGENT, 'WeChatDraft/1.0');
+        $data = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($data === false || $httpCode >= 400 || strlen($data) < 100) {
+            return false;
+        }
+
+        // 猜后缀（微信对扩展名敏感）：优先从 URL，兜底 .jpg
+        $ext = strtolower(pathinfo(parse_url($url, PHP_URL_PATH) ?: '', PATHINFO_EXTENSION));
+        if (!in_array($ext, ['jpg', 'jpeg', 'png', 'gif'], true)) {
+            $ext = 'jpg';
+        }
+
+        $tmp = tempnam(sys_get_temp_dir(), 'wxdraft_') . '.' . $ext;
+        if (file_put_contents($tmp, $data) === false) {
+            return false;
+        }
+        return $tmp;
     }
 
     /**
@@ -201,32 +285,224 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
         }
     }
 
-    /* 插件实现方法 */
-    public static function render($post,$obj){
+    /* 插件实现方法 —— Widget_Contents_Post_Edit::finishPublish 钩子入口
+     *
+     * 这里的策略判断只影响"用户在后台手动发文"的场景。
+     * 通过 syncDraft() 跨插件调用的链路是另一条入口，不经过这里。
+     */
+    public static function render($post, $obj){
+        // 带密码的私密文章 / 过短的内容直接跳过（保留原行为）
+        if (!empty($post['password']) || strlen($post['text']) <= 100) {
+            return;
+        }
+
         $setting = Helper::options()->plugin('WeChatDraft');
-        if (empty($post['password']) && strlen($post['text']) > 100 && $setting->appid && $setting->secret) {
-            $accessToken = self::getAccessToken();
-            $url = 'https://api.weixin.qq.com/cgi-bin/draft/add?access_token='.$accessToken;
-            if ($setting->author) {
+        $defaultAuto = is_array($setting->autoSyncDefault)
+            && in_array('enable', $setting->autoSyncDefault);
+        $keyword = !empty($setting->syncTriggerKeyword)
+            ? trim($setting->syncTriggerKeyword)
+            : 'wechat';
+
+        $decision = self::decideSyncForManualPost($post, $obj, $defaultAuto, $keyword);
+        if (!$decision['sync']) {
+            return;
+        }
+
+        self::syncDraft($obj->title, $obj->content, $obj->url);
+    }
+
+    /**
+     * 决定一篇手动发布的文章是否要同步
+     *
+     * 命中规则（任一即"标记命中"）：
+     *   1. 正文出现 <!--{keyword}--> 注释 / <!--no-{keyword}-->
+     *   2. 文章标签包含 {keyword} 或 no-{keyword}
+     *   3. 文章分类包含 {keyword} 或 no-{keyword}
+     *
+     * 决策矩阵：
+     *   opt-in 模式（autoSyncDefault=false）：命中正向标记才同步
+     *   opt-out 模式（autoSyncDefault=true）：命中反向标记才跳过
+     *
+     * @param array  $post         finishPublish 钩子的 $post 数组
+     * @param object $obj          finishPublish 钩子的 $obj（Widget_Contents_Post_Edit 实例）
+     * @param bool   $defaultAuto  true=opt-out, false=opt-in
+     * @param string $keyword      触发关键词
+     * @return array ['sync' => bool, 'reason' => string]  reason 仅用于调试
+     */
+    public static function decideSyncForManualPost($post, $obj, $defaultAuto, $keyword)
+    {
+        $content = isset($obj->content) ? $obj->content : (isset($post['text']) ? $post['text'] : '');
+        $positiveTag = strtolower($keyword);
+        $negativeTag = 'no-' . $positiveTag;
+
+        // 1) 正文注释（不区分大小写，允许标记前后有空白）
+        $hasPositiveComment = self::contentHasMarker($content, $positiveTag);
+        $hasNegativeComment = self::contentHasMarker($content, $negativeTag);
+
+        // 2/3) 标签 + 分类一起收集
+        $labels = self::collectLabels($obj, $post);
+        $hasPositiveLabel = in_array($positiveTag, $labels, true);
+        $hasNegativeLabel = in_array($negativeTag, $labels, true);
+
+        if ($defaultAuto) {
+            // opt-out 模式：默认发，命中任一反向标记则跳过
+            if ($hasNegativeComment || $hasNegativeLabel) {
+                return ['sync' => false, 'reason' => 'opt-out: marker matched'];
+            }
+            return ['sync' => true, 'reason' => 'opt-out default'];
+        }
+
+        // opt-in 模式：默认不发，命中任一正向标记才发
+        if ($hasPositiveComment || $hasPositiveLabel) {
+            return ['sync' => true, 'reason' => 'opt-in: marker matched'];
+        }
+        return ['sync' => false, 'reason' => 'opt-in default'];
+    }
+
+    /**
+     * 在内容中查找 <!--{token}--> 形式的注释（容忍空白、不区分大小写）
+     */
+    private static function contentHasMarker($content, $token)
+    {
+        if ($content === '' || $token === '') {
+            return false;
+        }
+        $pattern = '/<!--\s*' . preg_quote($token, '/') . '\s*-->/i';
+        return (bool) preg_match($pattern, $content);
+    }
+
+    /**
+     * 从 finishPublish 的入参里抠出标签 + 分类名（统一小写）
+     *
+     * Typecho 后台提交时 $post 里通常含 'tags'（逗号分隔）与 'category'（mid 数组）；
+     * 不同版本字段名可能略有差异，能抠到就抠，抠不到就空着——本插件的策略判断
+     * 不能因为反射失败而炸掉发文流程。
+     */
+    private static function collectLabels($obj, $post)
+    {
+        $labels = [];
+
+        // 1) 直接读 $post 里的 tags 字符串（逗号分隔）
+        if (!empty($post['tags'])) {
+            $tagsRaw = is_array($post['tags']) ? implode(',', $post['tags']) : (string) $post['tags'];
+            foreach (preg_split('/[,，]/', $tagsRaw) as $t) {
+                $t = strtolower(trim($t));
+                if ($t !== '') {
+                    $labels[] = $t;
+                }
+            }
+        }
+
+        // 2) 分类：$post['category'] 是 mid 数组，需要查 metas 表拿 name/slug
+        if (!empty($post['category'])) {
+            $cids = is_array($post['category']) ? $post['category'] : [$post['category']];
+            try {
+                $db = Typecho_Db::get();
+                foreach ($cids as $mid) {
+                    $row = $db->fetchRow(
+                        $db->select('name', 'slug')
+                            ->from('table.metas')
+                            ->where('mid = ?', intval($mid))
+                            ->limit(1)
+                    );
+                    if ($row) {
+                        if (!empty($row['name'])) $labels[] = strtolower($row['name']);
+                        if (!empty($row['slug'])) $labels[] = strtolower($row['slug']);
+                    }
+                }
+            } catch (Exception $e) {
+                // 数据库访问失败不影响策略判断，当作无标签处理
+            }
+        }
+
+        // 3) 兜底：obj->tags / obj->categories 如果存在（某些 Typecho 版本会塞进来）
+        foreach (['tags', 'categories'] as $field) {
+            if (isset($obj->{$field}) && is_array($obj->{$field})) {
+                foreach ($obj->{$field} as $row) {
+                    if (is_array($row)) {
+                        if (!empty($row['name'])) $labels[] = strtolower($row['name']);
+                        if (!empty($row['slug'])) $labels[] = strtolower($row['slug']);
+                    } elseif (is_object($row)) {
+                        if (!empty($row->name)) $labels[] = strtolower($row->name);
+                        if (!empty($row->slug)) $labels[] = strtolower($row->slug);
+                    } elseif (is_string($row)) {
+                        $labels[] = strtolower(trim($row));
+                    }
+                }
+            }
+        }
+
+        return array_values(array_unique(array_filter($labels)));
+    }
+
+    /**
+     * 公开的草稿同步入口
+     *
+     * 把一篇已 HTML 化的文章塞进微信公众号草稿箱。供 render() 内部使用，
+     * 同时供其他插件（如 AiDailyPost 自动发文流程）跨插件调用。
+     *
+     * 异常一律转成返回值——不让上游因为微信侧故障而失败。
+     *
+     * @param string      $title      文章标题
+     * @param string      $contentHtml 文章正文 HTML（不是 Markdown）
+     * @param string      $sourceUrl  原文 URL（content_source_url）
+     * @param string|null $authorOverride 覆盖配置/资料里的作者名，传 null 走默认
+     * @return array ['success' => bool, 'message' => string, 'media_id' => string|null]
+     */
+    public static function syncDraft($title, $contentHtml, $sourceUrl, $authorOverride = null)
+    {
+        try {
+            $setting = Helper::options()->plugin('WeChatDraft');
+            if (empty($setting->appid) || empty($setting->secret)) {
+                return ['success' => false, 'message' => 'WeChatDraft 未配置 AppID/Secret', 'media_id' => null];
+            }
+
+            // 决定作者：调用方覆盖 > 配置 > Typecho 用户昵称
+            if ($authorOverride !== null && $authorOverride !== '') {
+                $author = $authorOverride;
+            } elseif (!empty($setting->author)) {
                 $author = $setting->author;
             } else {
-                $user= Typecho_Widget::widget('Widget_User');
-                $author = $user->screenName;
+                try {
+                    $user = Typecho_Widget::widget('Widget_User');
+                    $author = $user->screenName;
+                } catch (Exception $e) {
+                    $author = '';
+                }
             }
+            // 微信侧作者字段限 8 个汉字
+            if (mb_strlen($author, 'UTF-8') > 8) {
+                $author = mb_substr($author, 0, 8, 'UTF-8');
+            }
+
             $mediaId = self::getMediaId();
-            $html = self::uploadImageToWeChat($obj->content);
-            $array = [
-                "articles"=>[
-                    [
-                        "title"=>$obj->title,
-                        "author"=>mb_strlen($author, 'UTF-8') > 8 ?mb_substr($author, 0, 8, 'UTF-8') :$author,
-                        "content"=>$html,
-                        "content_source_url"=>$obj->url,
-                        "thumb_media_id"=>$mediaId
-                    ]
-                ]
+            $html = self::uploadImageToWeChat($contentHtml);
+
+            $accessToken = self::getAccessToken();
+            $url = 'https://api.weixin.qq.com/cgi-bin/draft/add?access_token=' . $accessToken;
+            $payload = [
+                'articles' => [[
+                    'title'              => $title,
+                    'author'             => $author,
+                    'content'            => $html,
+                    'content_source_url' => $sourceUrl,
+                    'thumb_media_id'     => $mediaId,
+                ]],
             ];
-            self::curl($url,json_encode($array, JSON_UNESCAPED_UNICODE),true);
+            $resp = self::curl($url, json_encode($payload, JSON_UNESCAPED_UNICODE), true);
+
+            // curl() 成功路径下返回的对象一般含 media_id；失败路径已经在内部 throw 了
+            return [
+                'success'  => true,
+                'message'  => '微信草稿同步成功',
+                'media_id' => isset($resp->media_id) ? $resp->media_id : null,
+            ];
+        } catch (Exception $e) {
+            return [
+                'success'  => false,
+                'message'  => '微信草稿同步失败: ' . $e->getMessage(),
+                'media_id' => null,
+            ];
         }
     }
 }
