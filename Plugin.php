@@ -514,6 +514,35 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
      * @param string|null $authorOverride 覆盖配置/资料里的作者名，传 null 走默认
      * @return array ['success' => bool, 'message' => string, 'media_id' => string|null]
      */
+    /**
+     * 把 HTML 中的 <a href="url">text</a> 转为 "text（url）"
+     *
+     * 微信草稿箱 API 会剥离正文中的外链 href，使链接不可点击。
+     * 预处理后虽然不再是超链接，但 URL 以纯文本形式保留，用户可以复制粘贴。
+     *
+     * 只处理链到外部的链接（href 以 http/https 开头），小程序链接等不变。
+     *
+     * @param string $html
+     * @return string
+     */
+    private static function stripLinksForWeChat($html)
+    {
+        return preg_replace_callback(
+            '/<a\s+[^>]*href="(https?:\/\/[^"]+)"[^>]*>([^<]*)<\/a>/i',
+            function ($m) {
+                $url = trim($m[1]);
+                $text = trim($m[2]);
+                // 链接文本就是 URL 本身，无需重复
+                if ($text === '' || $text === $url) {
+                    return $url;
+                }
+                // 文本 + URL 形式：「原文链接（https://...）」「OpenAI 发布 GPT-5（https://...）」
+                return $text . '（' . $url . '）';
+            },
+            $html
+        );
+    }
+
     public static function syncDraft($title, $contentHtml, $sourceUrl, $authorOverride = null)
     {
         self::log("syncDraft 入参: title={$title}, sourceUrl={$sourceUrl}, html长度=" . strlen($contentHtml));
@@ -555,6 +584,10 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
             self::log('步骤 3/4: 处理正文图片...');
             $html = self::uploadImageToWeChat($contentHtml);
             self::log('正文图片处理完成，最终 html 长度: ' . strlen($html));
+
+            // 微信草稿 API 会剥离 <a> 标签的 href，导致链接不可点击
+            // 预处理：把 <a href="url">text</a> 转为 "text（url）"（保持全文可读）
+            $html = self::stripLinksForWeChat($html);
 
             self::log('步骤 4/4: 提交草稿到微信...');
             $url = 'https://api.weixin.qq.com/cgi-bin/draft/add?access_token=' . $accessToken;
