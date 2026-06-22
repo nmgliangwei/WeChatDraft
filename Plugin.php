@@ -78,6 +78,34 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
     /* 个人用户的配置方法 */
     public static function personalConfig(Typecho_Widget_Helper_Form $form){}
 
+    /**
+     * 日志文件路径
+     */
+    public static function logFile()
+    {
+        return dirname(__FILE__) . '/wechat-draft.log';
+    }
+
+    /**
+     * 写日志（每条都带时间戳；自动 rotate 防止文件爆炸）
+     *
+     * 因为整个流程都在 finishPublish 钩子里跑，向 stdout 输出会污染响应；
+     * 异常又会被钩子吞掉。所以必须落地到文件，调试时直接 tail。
+     *
+     * @param string $message
+     * @param string $level INFO / WARN / ERROR
+     */
+    public static function log($message, $level = 'INFO')
+    {
+        $file = self::logFile();
+        // 简单 rotate：超过 1MB 就 truncate（保留最新日志，丢弃历史）
+        if (file_exists($file) && filesize($file) > 1024 * 1024) {
+            @file_put_contents($file, '');
+        }
+        $line = '[' . date('Y-m-d H:i:s') . "] [{$level}] {$message}\n";
+        @file_put_contents($file, $line, FILE_APPEND | LOCK_EX);
+    }
+
     /* 获取微信access_token的方法 */
     public static function getAccessToken()
     {
@@ -248,6 +276,11 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
      */
     public static function curl($url,$jsonData = '',$ispost = false,$imagePath ='')
     {
+        // URL 脱敏（去掉 access_token 参数值）后打日志
+        $safeUrl = preg_replace('/access_token=[^&]+/', 'access_token=***', $url);
+        self::log("curl: {$safeUrl}" . ($ispost ? ' [POST]' : ' [GET]')
+            . ($imagePath ? " [upload:{$imagePath}]" : ''));
+
         $ch = curl_init();
         curl_setopt($ch, CURLOPT_URL, $url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
@@ -274,15 +307,30 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
         }
 
         $response = curl_exec($ch);
+        $curlErr = curl_error($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
 
-        $responseData = json_decode($response);
-        if (!isset($responseData->errmsg)) {
-            return $responseData;
-        } else {
-            // 请求失败，处理错误信息
-            throw new Exception($responseData->errmsg);
+        if ($response === false) {
+            self::log("curl 网络错误: {$curlErr} (HTTP {$httpCode})", 'ERROR');
+            throw new Exception("网络请求失败: {$curlErr}");
         }
+
+        // 截断长响应避免日志爆炸
+        self::log("curl 响应 (HTTP {$httpCode}): " . mb_substr($response, 0, 500, 'UTF-8'));
+
+        $responseData = json_decode($response);
+        if ($responseData === null) {
+            self::log("curl 响应非 JSON: " . mb_substr($response, 0, 200, 'UTF-8'), 'ERROR');
+            throw new Exception("响应解析失败，非 JSON 格式");
+        }
+        // 微信侧 errcode=0 是成功；有些接口只在错误时才返回 errmsg 字段
+        if (!isset($responseData->errmsg) || (isset($responseData->errcode) && intval($responseData->errcode) === 0)) {
+            return $responseData;
+        }
+        // 请求失败，处理错误信息
+        $errcode = isset($responseData->errcode) ? $responseData->errcode : '?';
+        throw new Exception("微信API错误 [errcode={$errcode}]: " . $responseData->errmsg);
     }
 
     /* 插件实现方法 —— Widget_Contents_Post_Edit::finishPublish 钩子入口
@@ -291,8 +339,18 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
      * 通过 syncDraft() 跨插件调用的链路是另一条入口，不经过这里。
      */
     public static function render($post, $obj){
+        self::log('=== render() 被触发 ===');
+        self::log('post 字段: ' . implode(',', array_keys($post)));
+        self::log('text 长度: ' . strlen($post['text'] ?? ''));
+        self::log('content 长度: ' . strlen($obj->content ?? ''));
+
         // 带密码的私密文章 / 过短的内容直接跳过（保留原行为）
-        if (!empty($post['password']) || strlen($post['text']) <= 100) {
+        if (!empty($post['password'])) {
+            self::log('跳过：文章带密码', 'WARN');
+            return;
+        }
+        if (strlen($post['text']) <= 100) {
+            self::log('跳过：text 长度 <= 100', 'WARN');
             return;
         }
 
@@ -302,13 +360,20 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
         $keyword = !empty($setting->syncTriggerKeyword)
             ? trim($setting->syncTriggerKeyword)
             : 'wechat';
+        self::log("配置: autoSyncDefault=" . ($defaultAuto ? 'true' : 'false') . ", keyword={$keyword}");
 
         $decision = self::decideSyncForManualPost($post, $obj, $defaultAuto, $keyword);
+        self::log('策略判断: sync=' . ($decision['sync'] ? 'true' : 'false') . ', reason=' . $decision['reason']);
         if (!$decision['sync']) {
             return;
         }
 
-        self::syncDraft($obj->title, $obj->content, $obj->url);
+        self::log('开始调用 syncDraft...');
+        $result = self::syncDraft($obj->title, $obj->content, $obj->url);
+        self::log('syncDraft 返回: success=' . ($result['success'] ? 'true' : 'false')
+            . ', message=' . $result['message']
+            . (isset($result['media_id']) ? ', media_id=' . $result['media_id'] : ''),
+            $result['success'] ? 'INFO' : 'ERROR');
     }
 
     /**
@@ -451,11 +516,14 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
      */
     public static function syncDraft($title, $contentHtml, $sourceUrl, $authorOverride = null)
     {
+        self::log("syncDraft 入参: title={$title}, sourceUrl={$sourceUrl}, html长度=" . strlen($contentHtml));
         try {
             $setting = Helper::options()->plugin('WeChatDraft');
             if (empty($setting->appid) || empty($setting->secret)) {
+                self::log('AppID 或 Secret 为空', 'ERROR');
                 return ['success' => false, 'message' => 'WeChatDraft 未配置 AppID/Secret', 'media_id' => null];
             }
+            self::log('AppID 前4位: ' . substr($setting->appid, 0, 4) . '***');
 
             // 决定作者：调用方覆盖 > 配置 > Typecho 用户昵称
             if ($authorOverride !== null && $authorOverride !== '') {
@@ -474,11 +542,21 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
             if (mb_strlen($author, 'UTF-8') > 8) {
                 $author = mb_substr($author, 0, 8, 'UTF-8');
             }
+            self::log("作者: {$author}");
 
-            $mediaId = self::getMediaId();
-            $html = self::uploadImageToWeChat($contentHtml);
-
+            self::log('步骤 1/4: 获取 access_token...');
             $accessToken = self::getAccessToken();
+            self::log('access_token 已获取: ' . substr($accessToken, 0, 8) . '***');
+
+            self::log('步骤 2/4: 获取 thumb_media_id...');
+            $mediaId = self::getMediaId();
+            self::log("thumb_media_id: {$mediaId}");
+
+            self::log('步骤 3/4: 处理正文图片...');
+            $html = self::uploadImageToWeChat($contentHtml);
+            self::log('正文图片处理完成，最终 html 长度: ' . strlen($html));
+
+            self::log('步骤 4/4: 提交草稿到微信...');
             $url = 'https://api.weixin.qq.com/cgi-bin/draft/add?access_token=' . $accessToken;
             $payload = [
                 'articles' => [[
@@ -490,6 +568,7 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
                 ]],
             ];
             $resp = self::curl($url, json_encode($payload, JSON_UNESCAPED_UNICODE), true);
+            self::log('微信响应: ' . json_encode($resp, JSON_UNESCAPED_UNICODE));
 
             // curl() 成功路径下返回的对象一般含 media_id；失败路径已经在内部 throw 了
             return [
@@ -498,6 +577,8 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
                 'media_id' => isset($resp->media_id) ? $resp->media_id : null,
             ];
         } catch (Exception $e) {
+            self::log('syncDraft 捕获异常: ' . $e->getMessage(), 'ERROR');
+            self::log('异常位置: ' . $e->getFile() . ':' . $e->getLine(), 'ERROR');
             return [
                 'success'  => false,
                 'message'  => '微信草稿同步失败: ' . $e->getMessage(),
