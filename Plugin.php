@@ -73,6 +73,17 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
               . '换成 <code>mp</code> 之类的也行，但需重启所有相关文章中的标签/注释一并改名。')
         );
         $form->addInput($syncTriggerKeyword);
+
+        // 默认封面图
+        $defaultThumbUrl = new Typecho_Widget_Helper_Form_Element_Text(
+            'defaultThumbUrl', NULL, '',
+            _t('默认封面图 URL'),
+            _t('填一张公网可访问的图片地址，插件自动上传到微信永久素材库作为图文封面。<br>'
+              . '建议尺寸 900×383 像素（2.35:1），JPG/PNG 格式。<br>'
+              . '如不填，则从已有图片素材列表中取第一张。<br>'
+              . '修改 URL 后插件会自动重新上传（老的素材库图片不会被删除）。')
+        );
+        $form->addInput($defaultThumbUrl);
     }
 
     /* 个人用户的配置方法 */
@@ -148,39 +159,118 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
         return $newAccessToken;
     }
 
-    /* 获取mediaid的方法 */
+    /* 获取 thumb_media_id 用作图文消息的封面
+     *
+     * 优先级：
+     *   1. 配置了「默认封面图 URL」→ 自动上传到永久素材库；URL 不变则用缓存
+     *   2. 没配 URL → 从已有图片素材中取第一张（兼容老逻辑）
+     *
+     * 缓存策略：
+     *   /cache/mediaId       → 缓存的 media_id（字符串）
+     *   /cache/mediaIdSource → 上次缓存对应的 URL（用于检测 URL 变更）
+     */
     public static function getMediaId(){
-        $file = dirname(__FILE__) . '/cache/mediaId';
-        $mediaId = file_exists($file) ? file_get_contents($file) : '';
-        if (empty($mediaId)) {
-            $accessToken = self::getAccessToken();
-            $url = 'https://api.weixin.qq.com/cgi-bin/material/batchget_material?access_token='.$accessToken;
-            // 获取图片素材列表中的图片作为图文消息的封面
-            $array = [
-                "type"=>"image",
-                "offset"=>0,
-                "count"=>20
-            ];
-            $mediaList = (self::curl($url,json_encode($array),true))->item;
-            // return $mediaList;
-            $matching = null;
-            foreach ($mediaList as $media) {
-                if ($media->name == "typecho.jpg") {
-                    $matching = $entry;
-                    break;
-                }
-            }
-            if ($matching != null) {
-                $media_id = $matching->media_id;
-            } else {
-                // 如果不存在匹配的条目，获取数组的第一个条目的media_id
-                $media_id = $mediaList[0]->media_id;
-            }
-            file_put_contents($file, $media_id);
-            return $media_id;
-        }
-        return $mediaId;
+        $cacheDir   = dirname(__FILE__) . '/cache';
+        $cacheFile  = $cacheDir . '/mediaId';
+        $sourceFile = $cacheDir . '/mediaIdSource';
 
+        $setting = Helper::options()->plugin('WeChatDraft');
+        $defaultThumbUrl = isset($setting->defaultThumbUrl) ? trim($setting->defaultThumbUrl) : '';
+
+        // 路径 1: 配了默认封面图 URL → 自动上传到永久素材库
+        if ($defaultThumbUrl !== '') {
+            $cachedSource = file_exists($sourceFile) ? trim(file_get_contents($sourceFile)) : '';
+            $cachedMediaId = file_exists($cacheFile) ? trim(file_get_contents($cacheFile)) : '';
+
+            // URL 没变 && 缓存有效 → 直接用缓存
+            if ($cachedMediaId !== '' && $cachedSource === $defaultThumbUrl) {
+                self::log("使用缓存的封面 media_id（URL 未变）");
+                return $cachedMediaId;
+            }
+
+            // URL 变了 / 首次配置 → 重新上传
+            self::log("默认封面 URL " . ($cachedSource === '' ? '首次配置' : '已变更') . "，开始上传到永久素材库");
+            $mediaId = self::uploadPermanentThumb($defaultThumbUrl);
+            if ($mediaId !== false) {
+                @file_put_contents($cacheFile, $mediaId);
+                @file_put_contents($sourceFile, $defaultThumbUrl);
+                self::log("封面图上传成功，新 media_id: {$mediaId}");
+                return $mediaId;
+            }
+            self::log("默认封面图上传失败，回退到「素材库取第一张」逻辑", 'WARN');
+            // 失败则继续走老逻辑
+        }
+
+        // 路径 2: 没配 URL（或上传失败回退）→ 从素材库取第一张
+        $mediaId = file_exists($cacheFile) ? trim(file_get_contents($cacheFile)) : '';
+        if (!empty($mediaId)) {
+            // 注意：如果你后台启用了默认封面图但又删了，可能要手动清缓存
+            return $mediaId;
+        }
+
+        $accessToken = self::getAccessToken();
+        $url = 'https://api.weixin.qq.com/cgi-bin/material/batchget_material?access_token=' . $accessToken;
+        $array = [
+            'type'   => 'image',
+            'offset' => 0,
+            'count'  => 20,
+        ];
+        $resp = self::curl($url, json_encode($array), true);
+        $mediaList = isset($resp->item) ? $resp->item : [];
+
+        if (empty($mediaList)) {
+            self::log('素材库为空，无法获取封面 media_id', 'ERROR');
+            throw new Exception('微信素材库为空，请先在公众号后台上传一张图片，或在插件设置中配置默认封面图 URL');
+        }
+
+        // 优先用名为 typecho.jpg 的图（兼容老逻辑）；否则取第一张
+        $matching = null;
+        foreach ($mediaList as $media) {
+            if (isset($media->name) && $media->name === 'typecho.jpg') {
+                $matching = $media;
+                break;
+            }
+        }
+        $media_id = $matching !== null ? $matching->media_id : $mediaList[0]->media_id;
+        @file_put_contents($cacheFile, $media_id);
+        return $media_id;
+    }
+
+    /**
+     * 把远程 URL 的图片上传到微信永久素材库
+     *
+     * 走 material/add_material 接口（type=image），上传后返回的 media_id 是永久有效的，
+     * 可以直接作为图文 thumb_media_id 使用。
+     *
+     * @param string $imageUrl 公网可访问的图片 URL
+     * @return string|false 成功返回 media_id；失败返回 false
+     */
+    private static function uploadPermanentThumb($imageUrl)
+    {
+        // 下载到本地临时文件
+        $tmpFile = self::downloadToTemp($imageUrl);
+        if ($tmpFile === false) {
+            self::log("封面图下载失败: {$imageUrl}", 'ERROR');
+            return false;
+        }
+        self::log("封面图下载到: {$tmpFile}，大小: " . filesize($tmpFile) . " 字节");
+
+        try {
+            $accessToken = self::getAccessToken();
+            // type=image 走永久素材库（永久有效，可用作 thumb_media_id）
+            $url = 'https://api.weixin.qq.com/cgi-bin/material/add_material?access_token=' . $accessToken . '&type=image';
+            $resp = self::curl($url, '', true, $tmpFile);
+            @unlink($tmpFile);
+            if (isset($resp->media_id)) {
+                return $resp->media_id;
+            }
+            self::log('上传永久素材：响应无 media_id 字段: ' . json_encode($resp, JSON_UNESCAPED_UNICODE), 'ERROR');
+            return false;
+        } catch (Exception $e) {
+            @unlink($tmpFile);
+            self::log('上传永久素材异常: ' . $e->getMessage(), 'ERROR');
+            return false;
+        }
     }
     /* 上传图片到素材库
      *
@@ -190,19 +280,27 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
      * 单张图片失败时跳过、保留原 src，让其他图片继续上传，整体不中断。
      */
     public static function uploadImageToWeChat($html){
+        // 预处理：把 Markdown 图片 ![alt](url) 先转为 <img> 标签
+        // 这样即使上游给的 HTML 里混着 Markdown 也能正确处理
+        $html = preg_replace('/!\[(.*?)\]\(([^)\s]+)\)/i', '<img src="$2" alt="$1">', $html);
+        self::log("Markdown 图片预处理后，html 长度: " . strlen($html));
+
         $accessToken = self::getAccessToken();
         $url = 'https://api.weixin.qq.com/cgi-bin/media/uploadimg?access_token='.$accessToken;
 
         // 匹配所有的 <img> 标签
         preg_match_all('/<img[^>]+>/i', $html, $matches);
         $images = $matches[0];
+        self::log("正文中找到 " . count($images) . " 个 <img> 标签");
 
         foreach ($images as $image) {
-            // 提取 <img> 标签中的 src 属性值
-            if (!preg_match('/src="([^"]+)"/i', $image, $srcMatches)) {
+            // 提取 src 属性（双引号 / 单引号 / 无引号都支持）
+            if (!preg_match('/src\s*=\s*["\']?([^"\'>\s]+)/i', $image, $srcMatches)) {
+                self::log("跳过无 src 的 img 标签: {$image}", 'WARN');
                 continue;
             }
             $src = $srcMatches[1];
+            self::log("处理图片: {$src}");
 
             // 远程 URL 先落盘到 tmp，本地路径直接用
             $tmpFile = null;
@@ -556,6 +654,53 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
         return $html;
     }
 
+    /**
+     * 解析封面图 media_id
+     *
+     * 优先级：
+     *   1. 文章正文首图（上传到永久素材库；每篇文章独立的封面）
+     *   2. 配置的默认封面图 URL
+     *   3. 素材库第一张图（getMediaId 老逻辑）
+     *
+     * @param string $firstImageUrl 从原始 HTML 中抠出的首图 URL（可能为空）
+     * @return string media_id
+     */
+    private static function resolveThumbMediaId($firstImageUrl)
+    {
+        // 1) 尝试用文章首图作为封面
+        if ($firstImageUrl !== '') {
+            self::log("尝试用文章首图作为封面: {$firstImageUrl}");
+            $mediaId = self::uploadPermanentThumb($firstImageUrl);
+            if ($mediaId !== false) {
+                self::log("文章首图作为封面成功: {$mediaId}");
+                return $mediaId;
+            }
+            self::log("文章首图上传永久素材失败，降级到默认封面", 'WARN');
+        }
+
+        // 2) 默认封面图 / 素材库第一张
+        return self::getMediaId();
+    }
+
+    /**
+     * 从 HTML 中提取第一张图片的 src
+     *
+     * @param string $html
+     * @return string 空字符串表示没图
+     */
+    private static function extractFirstImageUrl($content)
+    {
+        // HTML 格式：双引号 / 单引号 / 无引号都能匹配
+        if (preg_match('/<img[^>]+src\s*=\s*["\']?([^"\'>\s]+)/i', $content, $m)) {
+            return trim($m[1]);
+        }
+        // Markdown 格式 ![alt](url)
+        if (preg_match('/!\[.*?\]\(([^)\s]+)/', $content, $m)) {
+            return trim($m[1]);
+        }
+        return '';
+    }
+
     public static function syncDraft($title, $contentHtml, $sourceUrl, $authorOverride = null)
     {
         self::log("syncDraft 入参: title={$title}, sourceUrl={$sourceUrl}, html长度=" . strlen($contentHtml));
@@ -590,19 +735,26 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
             $accessToken = self::getAccessToken();
             self::log('access_token 已获取: ' . substr($accessToken, 0, 8) . '***');
 
-            self::log('步骤 2/4: 获取 thumb_media_id...');
-            $mediaId = self::getMediaId();
-            self::log("thumb_media_id: {$mediaId}");
+            self::log('步骤 2/4: 处理正文图片 + 决定封面...');
+            // 先抠出原始首图 URL（用博客侧 URL 上传到永久素材库，最可靠）
+            $originalFirstImg = self::extractFirstImageUrl($contentHtml);
+            if ($originalFirstImg !== '') {
+                self::log("正文首图（原始 URL）: {$originalFirstImg}");
+            } else {
+                self::log("正文无图片");
+            }
 
-            self::log('步骤 3/4: 处理正文图片...');
-            $html = self::uploadImageToWeChat($contentHtml);
+            // 剥外链 + 清空洞文本
+            $html = self::stripLinksForWeChat($contentHtml);
+            // 处理正文 <img>（远程下载 → 上传到微信 → 替换 src 为 mmbiz.qpic.cn 临时图片地址）
+            $html = self::uploadImageToWeChat($html);
             self::log('正文图片处理完成，最终 html 长度: ' . strlen($html));
 
-            // 微信草稿 API 会剥离 <a> 标签的 href，导致链接不可点击
-            // 预处理：把 <a href="url">text</a> 转为 "text（url）"（保持全文可读）
-            $html = self::stripLinksForWeChat($html);
+            // 封面图策略：优先用文章首图（上传到永久素材库）；找不到再用默认封面
+            $mediaId = self::resolveThumbMediaId($originalFirstImg);
+            self::log("最终 thumb_media_id: {$mediaId}");
 
-            self::log('步骤 4/4: 提交草稿到微信...');
+            self::log('步骤 3/4: 提交草稿到微信...');
             $url = 'https://api.weixin.qq.com/cgi-bin/draft/add?access_token=' . $accessToken;
             $payload = [
                 'articles' => [[
