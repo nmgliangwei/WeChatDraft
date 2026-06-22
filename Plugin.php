@@ -527,20 +527,33 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
      */
     private static function stripLinksForWeChat($html)
     {
-        return preg_replace_callback(
-            '/<a\s+[^>]*href="(https?:\/\/[^"]+)"[^>]*>([^<]*)<\/a>/i',
-            function ($m) {
-                $url = trim($m[1]);
-                $text = trim($m[2]);
-                // 链接文本就是 URL 本身，无需重复
-                if ($text === '' || $text === $url) {
-                    return $url;
+        // 微信草稿箱会剥离外链 href，导致链接不可点击。
+        // 处理策略：
+        //   1. 剥掉所有 <a> 标签，只保留显示文本（用户通过「阅读原文」按钮跳博客）
+        //   2. 如果显示文本是「原文链接 / 查看原文 / 阅读原文」等空洞引导词，
+        //      整个删掉（这些词没了链接就完全没意义）；
+        //      普通正文里出现的同样字眼不在 <a> 内，不受影响。
+        //   3. 清理因删链产生的空 <p> 和孤立标点。
+        $emptyLinkTexts = ['原文链接', '原文', '查看原文', '阅读原文', '详情', '查看详情', 'source', 'link'];
+
+        $html = preg_replace_callback(
+            '/<a\s+[^>]*href="https?:\/\/[^"]*"[^>]*>([^<]*)<\/a>/i',
+            function ($m) use ($emptyLinkTexts) {
+                $text = trim($m[1]);
+                if (in_array(strtolower($text), $emptyLinkTexts, true)) {
+                    return '';
                 }
-                // 文本 + URL 形式：「原文链接（https://...）」「OpenAI 发布 GPT-5（https://...）」
-                return $text . '（' . $url . '）';
+                return $text;
             },
             $html
         );
+
+        // 清理因删链留下的空段落
+        $html = preg_replace('/<p>\s*<\/p>/u', '', $html);
+        // 清理空 <li>（列表项里如果只有「原文链接」单独成项的情况）
+        $html = preg_replace('/<li>\s*<\/li>/u', '', $html);
+
+        return $html;
     }
 
     public static function syncDraft($title, $contentHtml, $sourceUrl, $authorOverride = null)
