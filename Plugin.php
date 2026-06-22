@@ -84,6 +84,17 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
               . '修改 URL 后插件会自动重新上传（老的素材库图片不会被删除）。')
         );
         $form->addInput($defaultThumbUrl);
+
+        // 下载图片时携带的 Referer（用于绕过 CDN 防盗链）
+        $downloadReferer = new Typecho_Widget_Helper_Form_Element_Text(
+            'downloadReferer', NULL, '',
+            _t('下载图片时的 Referer（防盗链）'),
+            _t('如果你的图片走 CDN 且开启了防盗链，PHP curl 下载图片会被拒绝。<br>'
+              . '在此填入一个被 CDN 白名单允许的来源 URL，如 <code>https://www.liangwei.cc/</code>。<br>'
+              . '留空则自动使用站点首页 URL。<br>'
+              . '影响范围：正文图片上传 + 封面图下载（含「文章首图作为封面」、「默认封面图 URL」两条路径）。')
+        );
+        $form->addInput($downloadReferer);
     }
 
     /* 个人用户的配置方法 */
@@ -347,11 +358,36 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
         curl_setopt($ch, CURLOPT_TIMEOUT, 30);
         curl_setopt($ch, CURLOPT_USERAGENT, 'WeChatDraft/1.0');
+
+        // Referer 头（用于绕过 CDN 防盗链）
+        // 优先取插件配置；空值则用站点首页 URL 兜底
+        try {
+            $referer = Helper::options()->plugin('WeChatDraft')->downloadReferer;
+            if (empty($referer)) {
+                $referer = Helper::options()->siteUrl;
+            }
+        } catch (Exception $e) {
+            $referer = '';
+        }
+        if (!empty($referer)) {
+            curl_setopt($ch, CURLOPT_REFERER, $referer);
+            self::log("downloadToTemp 设置 Referer: {$referer}");
+        }
         $data = curl_exec($ch);
+        $curlErr = curl_error($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
 
-        if ($data === false || $httpCode >= 400 || strlen($data) < 100) {
+        if ($data === false) {
+            self::log("downloadToTemp curl 错误: {$curlErr}", 'ERROR');
+            return false;
+        }
+        if ($httpCode >= 400) {
+            self::log("downloadToTemp HTTP {$httpCode}（可能被 CDN 防盗链拒绝；检查「下载图片时的 Referer」配置）", 'ERROR');
+            return false;
+        }
+        if (strlen($data) < 100) {
+            self::log("downloadToTemp 响应体过短 (" . strlen($data) . " 字节)，可能不是有效图片", 'ERROR');
             return false;
         }
 

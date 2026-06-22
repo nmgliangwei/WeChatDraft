@@ -1,0 +1,3 @@
+# 此目录用于存放运行时缓存（access_token、media_id 等），
+# 实际内容已通过仓库根的 .gitignore 排除。
+# 此占位文件保证从仓库部署时 cache/ 目录始终存在。

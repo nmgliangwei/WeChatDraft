@@ -1,0 +1,7 @@
+# 运行时缓存：access_token / media_id 等敏感凭据
+cache/*
+!cache/.gitkeep
+
+# 调试日志
+wechat-draft.log
+*.log
