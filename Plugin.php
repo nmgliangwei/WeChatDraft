@@ -95,6 +95,45 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
               . '影响范围：正文图片上传 + 封面图下载（含「文章首图作为封面」、「默认封面图 URL」两条路径）。')
         );
         $form->addInput($downloadReferer);
+
+        // User-Agent
+        $downloadUserAgent = new Typecho_Widget_Helper_Form_Element_Text(
+            'downloadUserAgent', NULL, '',
+            _t('下载图片时的 User-Agent'),
+            _t('某些 CDN / 防盗链会按 UA 判断是不是浏览器。留空走默认 <code>WeChatDraft/1.0</code>。<br>'
+              . '常见浏览器 UA 示例（直接复制粘贴）：<br>'
+              . '<code>Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36</code>')
+        );
+        $form->addInput($downloadUserAgent);
+
+        // 额外请求头
+        $downloadExtraHeaders = new Typecho_Widget_Helper_Form_Element_Textarea(
+            'downloadExtraHeaders', NULL, '',
+            _t('下载图片时的额外请求头（高级）'),
+            _t('每行一个 HTTP 头，<code>Header-Name: value</code> 格式。<br>'
+              . '示例：<br>'
+              . '<code>Cookie: token=abc</code><br>'
+              . '<code>X-Forwarded-For: 1.2.3.4</code><br>'
+              . '一般用不到，留空即可。')
+        );
+        $form->addInput($downloadExtraHeaders);
+
+        // 超时时间
+        $downloadTimeout = new Typecho_Widget_Helper_Form_Element_Text(
+            'downloadTimeout', NULL, '30',
+            _t('下载图片超时时间（秒）'),
+            _t('单张图片下载超过此秒数将放弃。默认 30 秒。大图或网络慢可改 60。')
+        );
+        $form->addInput($downloadTimeout);
+
+        // 代理
+        $downloadProxy = new Typecho_Widget_Helper_Form_Element_Text(
+            'downloadProxy', NULL, '',
+            _t('HTTP 代理（可选）'),
+            _t('如果服务器到 CDN 的网络受限，可以配代理。格式：<code>http://host:port</code> 或 <code>socks5://host:port</code>。<br>'
+              . '留空则直连。仅影响图片下载，不影响微信 API 调用。')
+        );
+        $form->addInput($downloadProxy);
     }
 
     /* 个人用户的配置方法 */
@@ -352,27 +391,37 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
      */
     private static function downloadToTemp($url)
     {
+        // 读出可调配置（一次取齐，避免多次 plugin() 调用）
+        $cfg = self::getDownloadConfig();
+
         $ch = curl_init($url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-        curl_setopt($ch, CURLOPT_USERAGENT, 'WeChatDraft/1.0');
+        curl_setopt($ch, CURLOPT_TIMEOUT, $cfg['timeout']);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
+        curl_setopt($ch, CURLOPT_USERAGENT, $cfg['userAgent']);
 
-        // Referer 头（用于绕过 CDN 防盗链）
-        // 优先取插件配置；空值则用站点首页 URL 兜底
-        try {
-            $referer = Helper::options()->plugin('WeChatDraft')->downloadReferer;
-            if (empty($referer)) {
-                $referer = Helper::options()->siteUrl;
-            }
-        } catch (Exception $e) {
-            $referer = '';
+        if (!empty($cfg['referer'])) {
+            curl_setopt($ch, CURLOPT_REFERER, $cfg['referer']);
         }
-        if (!empty($referer)) {
-            curl_setopt($ch, CURLOPT_REFERER, $referer);
-            self::log("downloadToTemp 设置 Referer: {$referer}");
+
+        if (!empty($cfg['extraHeaders'])) {
+            curl_setopt($ch, CURLOPT_HTTPHEADER, $cfg['extraHeaders']);
         }
+
+        if (!empty($cfg['proxy'])) {
+            curl_setopt($ch, CURLOPT_PROXY, $cfg['proxy']);
+        }
+
+        self::log("downloadToTemp 配置: " . json_encode([
+            'referer'   => $cfg['referer'],
+            'userAgent' => mb_substr($cfg['userAgent'], 0, 40, 'UTF-8'),
+            'timeout'   => $cfg['timeout'],
+            'proxy'     => $cfg['proxy'] ?: '(直连)',
+            'headers'   => count($cfg['extraHeaders']),
+        ], JSON_UNESCAPED_UNICODE));
+
         $data = curl_exec($ch);
         $curlErr = curl_error($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -402,6 +451,74 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
             return false;
         }
         return $tmp;
+    }
+
+    /**
+     * 统一读取下载相关配置（带默认值兜底）
+     *
+     * @return array {
+     *   referer: string,
+     *   userAgent: string,
+     *   extraHeaders: string[],
+     *   timeout: int,
+     *   proxy: string
+     * }
+     */
+    private static function getDownloadConfig()
+    {
+        $setting = null;
+        try {
+            $setting = Helper::options()->plugin('WeChatDraft');
+        } catch (Exception $e) {
+            // 没 typecho 上下文也别炸
+        }
+
+        // Referer
+        $referer = '';
+        if ($setting !== null && !empty($setting->downloadReferer)) {
+            $referer = $setting->downloadReferer;
+        } else {
+            try {
+                $referer = Helper::options()->siteUrl;
+            } catch (Exception $e) {}
+        }
+
+        // User-Agent
+        $userAgent = ($setting !== null && !empty($setting->downloadUserAgent))
+            ? $setting->downloadUserAgent
+            : 'WeChatDraft/1.0';
+
+        // 额外请求头（每行一个 Header: value）
+        $extraHeaders = [];
+        if ($setting !== null && !empty($setting->downloadExtraHeaders)) {
+            foreach (preg_split('/\r?\n/', $setting->downloadExtraHeaders) as $line) {
+                $line = trim($line);
+                if ($line !== '' && strpos($line, ':') !== false) {
+                    $extraHeaders[] = $line;
+                }
+            }
+        }
+
+        // 超时
+        $timeout = ($setting !== null && !empty($setting->downloadTimeout))
+            ? intval($setting->downloadTimeout)
+            : 30;
+        if ($timeout < 5 || $timeout > 300) {
+            $timeout = 30;
+        }
+
+        // 代理
+        $proxy = ($setting !== null && !empty($setting->downloadProxy))
+            ? trim($setting->downloadProxy)
+            : '';
+
+        return [
+            'referer'      => $referer,
+            'userAgent'    => $userAgent,
+            'extraHeaders' => $extraHeaders,
+            'timeout'      => $timeout,
+            'proxy'        => $proxy,
+        ];
     }
 
     /**
