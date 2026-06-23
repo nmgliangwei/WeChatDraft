@@ -4,9 +4,9 @@
  * 发布文章同步提交微信公众号草稿
  *
  * @package WeChatDraft
- * @author 心灵导师安德烈
- * @version 1.0.2
- * @link https://www.xvkes.cn
+ * @author LiangWei
+ * @version 1.0.3
+ * @link https://www.liangwei.cc
  */
 class WeChatDraft_Plugin implements Typecho_Plugin_Interface
 {
