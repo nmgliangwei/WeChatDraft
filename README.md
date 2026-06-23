@@ -158,17 +158,14 @@ if (class_exists('WeChatDraft_Plugin')) {
 - **`media_id` 拿不到 / 素材库为空**：首次使用时，要么配置「默认封面图 URL」，要么先在公众平台手动传一张图到素材库。
 - **草稿里图片显示不出来**：通常是图片本身就没下载成功，看日志里 `图片上传` 相关行定位。
 
-## 支持
-
-如果本插件帮到了你，不妨给点赞赏鼓励一下作者
-
-<img width="300" height="300" alt="支付宝" src="https://raw.githubusercontent.com/qiuzhangsaer/imageWarehouse/main/alipay.jpg"><img width="300" height="300" alt="微信" src="https://raw.githubusercontent.com/qiuzhangsaer/imageWarehouse/main/wechat.jpg">
 
 ## 帮助
 
 如果在安装、配置或使用 WeChatDraft 插件过程中遇到任何问题，请查阅以下资源获取帮助：
 
 - Typecho 官方论坛：<https://forum.typecho.org/>
-- 蓄客博客插件说明：<https://www.xvkes.cn/archives/290/>
-- 项目仓库：<https://github.com/qiuzhangsaer/WeChatDraft>
-- 提交 Issue：<https://github.com/qiuzhangsaer/WeChatDraft/issues>
+- 项目仓库：<https://github.com/nmgliangwei/WeChatDraft>
+- 提交 Issue：<https://github.com/nmgliangwei/WeChatDraft/issues>
+
+## 感谢
+ - 特别感谢由 [qiuzhangsaer](https://github.com/qiuzhangsaer/WeChatDraft) 提供的基础代码，本项目在此基础上进行了功能优化和升级
