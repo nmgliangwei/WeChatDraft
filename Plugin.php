@@ -80,10 +80,26 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
             _t('默认封面图 URL'),
             _t('填一张公网可访问的图片地址，插件自动上传到微信永久素材库作为图文封面。<br>'
               . '建议尺寸 900×383 像素（2.35:1），JPG/PNG 格式。<br>'
-              . '如不填，则从已有图片素材列表中取第一张。<br>'
+              . '与「封面图优先策略」配合使用：<br>'
+              . '• <b>文章首图优先</b>（默认）：用文章正文里的第一张图，没有图时才用此默认封面；都没有则取素材库第一张。<br>'
+              . '• <b>默认封面优先</b>：每篇文章都用此默认封面；未填写本项则降级到文章首图；再没有则取素材库第一张。<br>'
               . '修改 URL 后插件会自动重新上传（老的素材库图片不会被删除）。')
         );
         $form->addInput($defaultThumbUrl);
+
+        // 封面图优先策略
+        $coverStrategy = new Typecho_Widget_Helper_Form_Element_Radio(
+            'coverStrategy',
+            [
+                'article_first' => _t('文章首图优先（推荐）：文章里有图就用文章首图，没有才用默认封面'),
+                'default_first' => _t('默认封面优先：所有文章统一使用上面配置的默认封面；未配置则降级到文章首图'),
+            ],
+            'article_first',
+            _t('封面图优先策略'),
+            _t('控制图文封面 thumb_media_id 的来源顺序。<br>'
+              . '两个模式都会在最终找不到图时回退到「微信素材库的第一张图」作为兜底。')
+        );
+        $form->addInput($coverStrategy);
 
         // 下载图片时携带的 Referer（用于绕过 CDN 防盗链）
         $downloadReferer = new Typecho_Widget_Helper_Form_Element_Text(
@@ -810,19 +826,42 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
     /**
      * 解析封面图 media_id
      *
-     * 优先级：
-     *   1. 文章正文首图（上传到永久素材库；每篇文章独立的封面）
-     *   2. 配置的默认封面图 URL
-     *   3. 素材库第一张图（getMediaId 老逻辑）
+     * 由「封面图优先策略」决定顺序：
+     *   article_first（默认）：文章首图 → 默认封面 URL → 素材库第一张
+     *   default_first       ：默认封面 URL → 文章首图 → 素材库第一张
      *
      * @param string $firstImageUrl 从原始 HTML 中抠出的首图 URL（可能为空）
      * @return string media_id
      */
     private static function resolveThumbMediaId($firstImageUrl)
     {
-        // 1) 尝试用文章首图作为封面
+        $setting = Helper::options()->plugin('WeChatDraft');
+        $strategy = isset($setting->coverStrategy) ? $setting->coverStrategy : 'article_first';
+        $defaultThumbUrl = isset($setting->defaultThumbUrl) ? trim($setting->defaultThumbUrl) : '';
+
+        // 策略 A: 默认封面优先
+        if ($strategy === 'default_first' && $defaultThumbUrl !== '') {
+            self::log("封面策略=default_first，优先使用默认封面 URL");
+            try {
+                return self::getMediaId(); // 内部已带「默认封面 URL → 素材库」逻辑
+            } catch (Exception $e) {
+                self::log("默认封面获取失败：" . $e->getMessage() . "，降级到文章首图", 'WARN');
+            }
+            // 默认封面拿不到 → 降级到文章首图
+            if ($firstImageUrl !== '') {
+                $mediaId = self::uploadPermanentThumb($firstImageUrl);
+                if ($mediaId !== false) {
+                    self::log("降级用文章首图作为封面成功: {$mediaId}");
+                    return $mediaId;
+                }
+            }
+            // 都没成功 → 抛给 getMediaId 走素材库兜底
+            return self::getMediaId();
+        }
+
+        // 策略 B: 文章首图优先（默认）
         if ($firstImageUrl !== '') {
-            self::log("尝试用文章首图作为封面: {$firstImageUrl}");
+            self::log("封面策略=article_first，尝试用文章首图作为封面: {$firstImageUrl}");
             $mediaId = self::uploadPermanentThumb($firstImageUrl);
             if ($mediaId !== false) {
                 self::log("文章首图作为封面成功: {$mediaId}");
@@ -831,7 +870,7 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
             self::log("文章首图上传永久素材失败，降级到默认封面", 'WARN');
         }
 
-        // 2) 默认封面图 / 素材库第一张
+        // 没有文章首图 / 上传失败 → 默认封面 URL / 素材库第一张
         return self::getMediaId();
     }
 
