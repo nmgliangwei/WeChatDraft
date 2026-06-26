@@ -5,7 +5,7 @@
  *
  * @package WeChatDraft
  * @author LiangWei
- * @version 1.0.3
+ * @version 1.0.4
  * @link https://www.liangwei.cc
  */
 class WeChatDraft_Plugin implements Typecho_Plugin_Interface
@@ -150,6 +150,34 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
               . '留空则直连。仅影响图片下载，不影响微信 API 调用。')
         );
         $form->addInput($downloadProxy);
+
+        // ====== 排版美化 ======
+        // 微信公众号编辑器只认 inline style，不识别 <style>/外链 CSS。
+        // 启用后插件会在提交草稿前用 DOMDocument 给 h1-h6 / p / ul / ol / table /
+        // blockquote / inline code / pre 等标签注入 inline style，并在最外层
+        // 包一层「nice」section 统一字体行高。已有 style 属性的标签会保留原值，
+        // 只补未设置的属性，不会覆盖博客主题已经设定的样式。
+        $beautifyHtml = new Typecho_Widget_Helper_Form_Element_Checkbox(
+            'beautifyHtml',
+            ['enable' => _t('启用排版美化（推荐）')],
+            [],
+            _t('排版美化'),
+            _t('提交草稿前给正文 HTML 注入 inline style，让微信公众号里的排版风格更接近 markdown 编辑器。<br>'
+              . '处理范围：整体字体/行高、h1–h6 标题、段落、有序/无序列表、表格、引用块、行内 code、代码块。<br>'
+              . '已有 <code>style</code> 属性的标签保留原值（只补未设置的属性），不影响博客原有样式。<br>'
+              . '默认关闭。开启后如果发现某种排版需要调整，欢迎反馈。')
+        );
+        $form->addInput($beautifyHtml);
+
+        // 主题色：用于 h1/h2 描边、blockquote 左侧竖线、inline code 文字、strong 加粗等
+        $beautifyThemeColor = new Typecho_Widget_Helper_Form_Element_Text(
+            'beautifyThemeColor', NULL, 'hsl(216, 100%, 68%)',
+            _t('美化主题色'),
+            _t('排版美化使用的主色，会出现在标题描边、引用块左侧竖线、行内 code、加粗等位置。<br>'
+              . '默认 <code>hsl(216, 100%, 68%)</code>（蓝色）。可填任何合法 CSS 颜色，如 <code>#1e88e5</code>、<code>rgb(255, 99, 71)</code>。<br>'
+              . '仅在「排版美化」启用时生效。')
+        );
+        $form->addInput($beautifyThemeColor);
     }
 
     /* 个人用户的配置方法 */
@@ -824,6 +852,282 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
     }
 
     /**
+     * 给正文 HTML 注入 inline style（微信公众号编辑器只认 inline style）
+     *
+     * 设计原则：
+     *   1. 只补未设置的样式 —— 如果某个标签上已经有 style 属性，原值优先，
+     *      插件追加的样式放在 style 字符串前面，被原有声明覆盖（CSS 后写优先）。
+     *      这样不会破坏博客主题已经设定的视觉效果。
+     *   2. 整体包一层 <section id="nice"> 设定全文基础字号/行高/字体，
+     *      模仿 markdown.com.cn 编辑器的默认外观。
+     *   3. 代码块仅做结构包装（外层 section + flex 布局），不引入 GeSHi 等
+     *      高亮库 —— 代码颜色由微信公众号编辑器自身渲染。
+     *
+     * @param string $html       已 stripLinks 处理过的正文 HTML
+     * @param string $themeColor CSS 颜色字符串
+     * @return string 美化后的 HTML（外层带 section 壳）
+     */
+    private static function beautifyHtmlForWeChat($html, $themeColor)
+    {
+        if ($html === '' || $html === null) {
+            return $html;
+        }
+
+        // 防御：主题色非法时回退默认值（避免污染 style 字符串）
+        if ($themeColor === '' || preg_match('/[<>"\']/', $themeColor)) {
+            $themeColor = 'hsl(216, 100%, 68%)';
+        }
+
+        // ========== 第 1 步：构造按标签的 style 表 ==========
+        // 这里的样式参考了上游 TeohZY/WeChatDraft 的 CustomParsedown.php，
+        // 在微信编辑器里实测过。padding/margin 数值保守，避免和博客主题打架。
+        $styleMap = [
+            'h1' => "font-size:1.7em;font-weight:normal;color:#333;"
+                  . "border-bottom:2px solid {$themeColor};"
+                  . "padding-bottom:6px;margin:30px 0 15px;",
+            'h2' => "font-size:1.4em;font-weight:normal;color:#333;"
+                  . "border-bottom:1px solid {$themeColor};"
+                  . "padding-bottom:4px;margin:30px 0 15px;",
+            'h3' => "font-size:1.2em;font-weight:normal;color:#333;margin:30px 0 15px;",
+            'h4' => "font-size:1.1em;font-weight:bold;color:#333;margin:24px 0 12px;",
+            'h5' => "font-size:1em;font-weight:bold;color:#333;margin:20px 0 10px;",
+            'h6' => "font-size:1em;font-weight:normal;color:{$themeColor};"
+                  . "border-bottom:1px solid {$themeColor};"
+                  . "padding-bottom:2px;margin:20px 0 10px;",
+            'p'  => "font-size:16px;padding:8px 0;margin:0;line-height:26px;color:#333;",
+            'ul' => "margin:8px 0;color:#333;list-style-type:disc;padding-left:2em;",
+            'ol' => "margin:8px 0;color:#333;list-style-type:decimal;padding-left:2em;",
+            'li' => "margin:4px 0;line-height:26px;",
+            'blockquote' => "background:#f9f9f9;border-left:4px solid {$themeColor};"
+                          . "padding:10px 16px;margin:15px 0;color:#555;",
+            'table' => "display:table;text-align:left;margin:1.5em auto;width:auto;"
+                     . "border-collapse:collapse;font-size:15px;",
+            'thead' => "background:#fafafa;",
+            'th' => "border:1px solid #ccc;padding:6px 12px;text-align:center;"
+                  . "font-weight:bold;color:#333;",
+            'td' => "border:1px solid #ccc;padding:6px 12px;color:#555;",
+            'strong' => "color:{$themeColor};",
+            'hr' => "border:none;border-top:1px dashed #ccc;margin:20px 0;",
+        ];
+
+        // ========== 第 2 步：加载 HTML 到 DOM ==========
+        // 用 XML 声明（`<` + `?xml encoding="UTF-8"?` + `>`，不在这里写完整字面量
+        // 以免提前关闭 PHP 标签）告诉 DOMDocument 内容是 UTF-8，
+        // 避免在 PHP 8.2+ 上调用已弃用的 mb_convert_encoding(..., 'HTML-ENTITIES')。
+        // 用一个已知的根包裹（wxbeautify-root）便于后面精确提取 inner HTML。
+        $dom = new DOMDocument('1.0', 'UTF-8');
+        $prev = libxml_use_internal_errors(true);
+        $wrapped = '<?xml encoding="UTF-8"?><div id="wxbeautify-root">' . $html . '</div>';
+        $loaded = $dom->loadHTML($wrapped, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+        libxml_clear_errors();
+        libxml_use_internal_errors($prev);
+
+        if (!$loaded) {
+            self::log('beautifyHtmlForWeChat: DOM 加载失败，回退到原始 HTML', 'WARN');
+            return $html;
+        }
+
+        // ========== 第 3 步：按标签批量注入样式 ==========
+        foreach ($styleMap as $tag => $style) {
+            $nodes = $dom->getElementsByTagName($tag);
+            // 把 NodeList 物化成数组：getElementsByTagName 是 live 的，
+            // 边遍历边改属性也没问题（不影响节点列表本身），但留个保险。
+            $list = [];
+            foreach ($nodes as $n) {
+                $list[] = $n;
+            }
+            foreach ($list as $el) {
+                self::mergeInlineStyle($el, $style);
+            }
+        }
+
+        // 行内 code：只处理不在 <pre> 里的 <code>。<pre><code> 在第 4 步统一处理。
+        foreach ($dom->getElementsByTagName('code') as $code) {
+            if ($code->parentNode && strtolower($code->parentNode->nodeName) === 'pre') {
+                continue;
+            }
+            self::mergeInlineStyle(
+                $code,
+                "font-size:14px;padding:2px 6px;border-radius:4px;margin:0 2px;"
+                . "background-color:rgba(27,31,35,.05);color:{$themeColor};"
+                . "font-family:Consolas,Monaco,Menlo,monospace;word-break:break-all;"
+            );
+        }
+
+        // ========== 第 4 步：代码块包装 ==========
+        // 把 <pre><code class="language-xx">…</code></pre> 替换成微信公众号编辑器
+        // 同款两栏结构：左侧 <ul>(行号占位) + 右侧 <pre>。不做语法高亮，让微信
+        // 编辑器或读者的客户端原生渲染等宽字体即可。
+        $preList = [];
+        foreach ($dom->getElementsByTagName('pre') as $pre) {
+            $preList[] = $pre;
+        }
+        foreach ($preList as $pre) {
+            self::wrapCodeBlock($dom, $pre, $themeColor);
+        }
+
+        // ========== 第 5 步：提取 inner HTML，并包外层 section 壳 ==========
+        $root = $dom->getElementById('wxbeautify-root');
+        if ($root === null) {
+            // 极少情况：DOM 没找到根，回退到原 HTML
+            self::log('beautifyHtmlForWeChat: 未找到 wxbeautify-root，回退', 'WARN');
+            return $html;
+        }
+        $inner = '';
+        foreach ($root->childNodes as $child) {
+            $inner .= $dom->saveHTML($child);
+        }
+
+        // 外层 section 壳：参考 markdown.com.cn 编辑器的 nice 主题。
+        // text-align:justify + word-break:break-all 适合中英文混排。
+        $shellStyle = 'font-size:16px;color:#333;padding:20px 16px;'
+                    . 'line-height:1.7;word-spacing:0;letter-spacing:0;'
+                    . 'word-wrap:break-word;text-align:justify;'
+                    . "font-family:'PingFang SC','Microsoft YaHei',sans-serif;"
+                    . 'word-break:break-all;';
+
+        return '<section id="nice" data-tool="WeChatDraft" style="' . $shellStyle . '">'
+             . $inner
+             . '</section>';
+    }
+
+    /**
+     * 合并 inline style：插件追加的样式放前面，原有声明放后面
+     *
+     * 这样如果原 HTML 上的 style 和插件 styleMap 里有同名属性，原有声明会覆盖
+     * 插件的（CSS 同优先级后写胜出），既不破坏博客主题，又能在原本没设的属性上
+     * 补足美化。
+     *
+     * @param DOMElement $el
+     * @param string     $appendStyle 插件想注入的 style 片段（以分号结尾或不结尾都行）
+     */
+    private static function mergeInlineStyle(DOMElement $el, $appendStyle)
+    {
+        $appendStyle = rtrim(trim($appendStyle), ';');
+        if ($appendStyle === '') {
+            return;
+        }
+        $existing = $el->hasAttribute('style') ? trim($el->getAttribute('style')) : '';
+        if ($existing === '') {
+            $el->setAttribute('style', $appendStyle . ';');
+            return;
+        }
+        // 插件样式放前 → 原有样式放后（同名属性原值生效）
+        $existing = rtrim($existing, ';');
+        $el->setAttribute('style', $appendStyle . ';' . $existing . ';');
+    }
+
+    /**
+     * 把 <pre><code> 块替换成微信编辑器同款的 code-snippet 两栏结构
+     *
+     * 输入形如：
+     *   <pre><code class="language-php">echo "hi";\n echo "bye";</code></pre>
+     * 输出形如：
+     *   <section class="code-snippet__fix code-snippet__js" style="...">
+     *     <ul class="code-snippet__line-index code-snippet__js">
+     *       <li></li><li></li>...
+     *     </ul>
+     *     <pre data-lang="php" class="code-snippet__js">
+     *       <code>echo "hi";</code><code>echo "bye";</code>
+     *     </pre>
+     *   </section>
+     *
+     * 微信公众号编辑器识别这个结构，会按代码块样式渲染（等宽字体 + 行号竖条）。
+     *
+     * @param DOMDocument $dom
+     * @param DOMElement  $pre   原 <pre> 节点
+     * @param string      $themeColor
+     */
+    private static function wrapCodeBlock(DOMDocument $dom, DOMElement $pre, $themeColor)
+    {
+        // 先提取语言和内部代码文本
+        // 兼容两种形态：<pre><code class="language-xx">…</code></pre>  和  <pre>裸文本</pre>
+        $language = 'plaintext';
+        $codeText = '';
+        $innerCode = null;
+        foreach ($pre->childNodes as $child) {
+            if ($child->nodeType === XML_ELEMENT_NODE && strtolower($child->nodeName) === 'code') {
+                $innerCode = $child;
+                break;
+            }
+        }
+        if ($innerCode !== null) {
+            // 从 class="language-xx" 抠语言
+            if ($innerCode->hasAttribute('class')) {
+                if (preg_match('/language-([a-zA-Z0-9_+\-]+)/', $innerCode->getAttribute('class'), $m)) {
+                    $language = $m[1];
+                }
+            }
+            $codeText = $innerCode->textContent;
+        } else {
+            $codeText = $pre->textContent;
+        }
+
+        // 按行切分（保留空行结构）
+        $codeText = str_replace(["\r\n", "\r"], "\n", $codeText);
+        $lines = explode("\n", $codeText);
+        // 末尾如果是空行，扔掉以免多一个空 <code>
+        if (count($lines) > 0 && $lines[count($lines) - 1] === '') {
+            array_pop($lines);
+        }
+        if (count($lines) === 0) {
+            $lines = [''];
+        }
+
+        // 构造外层 section
+        $section = $dom->createElement('section');
+        $section->setAttribute('class', 'code-snippet__fix code-snippet__js');
+        $section->setAttribute('style',
+            'margin:10px 0;text-align:left;font-weight:500;font-size:14px;'
+            . 'display:flex;color:#333;position:relative;'
+            . 'background-color:rgba(0,0,0,0.03);'
+            . 'border:1px solid #f0f0f0;border-radius:4px;'
+            . 'line-height:20px;word-wrap:break-word;'
+            . 'overflow-x:auto;'
+        );
+
+        // 左侧行号 <ul>
+        $ul = $dom->createElement('ul');
+        $ul->setAttribute('class', 'code-snippet__line-index code-snippet__js');
+        $ul->setAttribute('style',
+            'list-style:none;margin:0;padding:0 8px 0 12px;'
+            . 'border-right:1px solid #eee;color:#999;'
+            . 'min-width:24px;text-align:right;'
+            . 'font-family:Consolas,Monaco,Menlo,monospace;'
+        );
+        for ($i = 0; $i < count($lines); $i++) {
+            $li = $dom->createElement('li');
+            $li->setAttribute('style', 'list-style:none;');
+            $ul->appendChild($li);
+        }
+
+        // 右侧代码 <pre>
+        $newPre = $dom->createElement('pre');
+        $newPre->setAttribute('class', 'code-snippet__js');
+        $newPre->setAttribute('data-lang', $language);
+        $newPre->setAttribute('style',
+            'margin:0;padding:8px 12px;flex:1;'
+            . 'font-family:Consolas,Monaco,Menlo,monospace;'
+            . 'font-size:14px;line-height:20px;'
+            . 'white-space:pre;overflow-x:auto;'
+            . 'background:transparent;'
+        );
+        foreach ($lines as $line) {
+            $codeEl = $dom->createElement('code');
+            $codeEl->setAttribute('style', 'display:block;white-space:pre;');
+            // textContent 由 DOM 自动转义，确保 < & 之类不会破坏结构
+            $codeEl->appendChild($dom->createTextNode($line === '' ? ' ' : $line));
+            $newPre->appendChild($codeEl);
+        }
+
+        $section->appendChild($ul);
+        $section->appendChild($newPre);
+
+        // 用新的 section 替换原 <pre>
+        $pre->parentNode->replaceChild($section, $pre);
+    }
+
+    /**
      * 解析封面图 media_id
      *
      * 由「封面图优先策略」决定顺序：
@@ -938,6 +1242,20 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
 
             // 剥外链 + 清空洞文本
             $html = self::stripLinksForWeChat($contentHtml);
+
+            // 排版美化（可选）：给标题/段落/列表/表格/blockquote/code 注入 inline style
+            // 必须在 uploadImageToWeChat 之前 —— 美化后正文 <img> 仍保留原始 src，
+            // 后续才能正确替换成微信侧的 mmbiz.qpic.cn 链接。
+            if (!empty($setting->beautifyHtml) && is_array($setting->beautifyHtml)
+                && in_array('enable', $setting->beautifyHtml, true)) {
+                $themeColor = !empty($setting->beautifyThemeColor)
+                    ? trim($setting->beautifyThemeColor)
+                    : 'hsl(216, 100%, 68%)';
+                self::log("排版美化已启用，主题色: {$themeColor}");
+                $html = self::beautifyHtmlForWeChat($html, $themeColor);
+                self::log('美化后 html 长度: ' . strlen($html));
+            }
+
             // 处理正文 <img>（远程下载 → 上传到微信 → 替换 src 为 mmbiz.qpic.cn 临时图片地址）
             $html = self::uploadImageToWeChat($html);
             self::log('正文图片处理完成，最终 html 长度: ' . strlen($html));
