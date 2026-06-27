@@ -810,12 +810,13 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
      * @return array ['success' => bool, 'message' => string, 'media_id' => string|null]
      */
     /**
-     * 把 HTML 中的 <a href="url">text</a> 转为 "text（url）"
+     * 清理正文 HTML，为微信公众号草稿做准备：
+     *   - 剥掉 <a> 标签（微信草稿 API 会剥离外链 href，链接不可点击）
+     *   - 移除「原文链接 / 阅读原文 / 链接」等空洞引导词
+     *   - 删除裸的「（链接）/(链接)」括号注释
+     *   - 删除 <hr> 分隔线（在微信里渲染成虚线，破坏视觉节奏）
      *
-     * 微信草稿箱 API 会剥离正文中的外链 href，使链接不可点击。
-     * 预处理后虽然不再是超链接，但 URL 以纯文本形式保留，用户可以复制粘贴。
-     *
-     * 只处理链到外部的链接（href 以 http/https 开头），小程序链接等不变。
+     * 读者通过文章底部的「阅读原文」按钮回到博客原文。
      *
      * @param string $html
      * @return string
@@ -825,11 +826,16 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
         // 微信草稿箱会剥离外链 href，导致链接不可点击。
         // 处理策略：
         //   1. 剥掉所有 <a> 标签，只保留显示文本（用户通过「阅读原文」按钮跳博客）
-        //   2. 如果显示文本是「原文链接 / 查看原文 / 阅读原文」等空洞引导词，
+        //   2. 如果显示文本是「原文链接 / 查看原文 / 阅读原文 / 链接」等空洞引导词，
         //      整个删掉（这些词没了链接就完全没意义）；
         //      普通正文里出现的同样字眼不在 <a> 内，不受影响。
-        //   3. 清理因删链产生的空 <p> 和孤立标点。
-        $emptyLinkTexts = ['原文链接', '原文', '查看原文', '阅读原文', '详情', '查看详情', 'source', 'link'];
+        //   3. 删除正文里裸的「（链接）」/「(链接)」括号注释（不在 <a> 内的纯文本）。
+        //      —— 这些通常是源 HTML 自带的 URL 提示，剥外链后失去意义。
+        //   4. 删除 <hr> 分隔线 —— 微信里渲染成虚线，破坏视觉节奏；公众号正文用段落
+        //      留白分节即可。
+        //   5. 清理因删链产生的空 <p> 和孤立标点。
+        $emptyLinkTexts = ['原文链接', '原文', '查看原文', '阅读原文', '详情', '查看详情',
+                           'source', 'link', '链接', '（链接）', '(链接)'];
 
         $html = preg_replace_callback(
             '/<a\s+[^>]*href="https?:\/\/[^"]*"[^>]*>([^<]*)<\/a>/i',
@@ -842,6 +848,13 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
             },
             $html
         );
+
+        // 删除正文里裸的「（链接）」/「(链接)」括号注释（半角/全角括号都覆盖）
+        $html = preg_replace('/[（(]\s*链接\s*[）)]/u', '', $html);
+
+        // 删除 <hr> 分隔线（自闭合 / 带属性 / 闭合标签都覆盖）
+        $html = preg_replace('/<hr\b[^>]*\/?>/i', '', $html);
+        $html = preg_replace('/<\/hr>/i', '', $html);
 
         // 清理因删链留下的空段落
         $html = preg_replace('/<p>\s*<\/p>/u', '', $html);
@@ -907,7 +920,6 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
                   . "font-weight:bold;color:#333;",
             'td' => "border:1px solid #ccc;padding:6px 12px;color:#555;",
             'strong' => "color:{$themeColor};",
-            'hr' => "border:none;border-top:1px dashed #ccc;margin:20px 0;",
         ];
 
         // ========== 第 2 步：加载 HTML 到 DOM ==========
