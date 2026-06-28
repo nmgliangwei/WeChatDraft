@@ -1209,6 +1209,49 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
         return '';
     }
 
+    /**
+     * 从文章 HTML 生成公众号摘要（digest）
+     *
+     * 微信草稿 API 的 digest 字段最长 120 个汉字。不传时微信会自动从正文截取，
+     * 但截出来常带 HTML/markdown 残渣。主动传一个干净的纯文本摘要更可控。
+     *
+     * 清洗顺序（每一步都为了去掉一类不该出现在摘要里的字符）：
+     *   1. 把 markdown 图片 ![alt](url) 收掉 —— 留 alt（通常更有意义）
+     *   2. 把 markdown 链接 [text](url) 留 text，丢 url
+     *   3. strip_tags 剥掉所有 HTML 标签
+     *   4. 解 HTML 实体（&nbsp; &amp; &lt; 等还原成字符）
+     *   5. 合并所有空白字符（含中文全角空格 U+3000、换行、tab）为单空格
+     *   6. mb_substr 按 UTF-8 字符截取，避免切到半个汉字
+     *
+     * @param string $contentHtml 原始文章 HTML
+     * @param int    $maxLen      最大长度（汉字数），默认 120 对齐微信限制
+     * @return string 纯文本摘要
+     */
+    private static function generateDigest($contentHtml, $maxLen = 120)
+    {
+        if ($contentHtml === '' || $contentHtml === null) {
+            return '';
+        }
+        $text = $contentHtml;
+
+        // 1) markdown 图片 → 保留 alt
+        $text = preg_replace('/!\[([^\]]*)\]\([^)]*\)/u', '$1', $text);
+        // 2) markdown 链接 → 保留 text
+        $text = preg_replace('/\[([^\]]*)\]\([^)]*\)/u', '$1', $text);
+        // 3) HTML 标签
+        $text = strip_tags($text);
+        // 4) HTML 实体（ENT_QUOTES 同时处理单双引号；HTML5 支持新实体如 &check;）
+        $text = html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        // 5) 空白合并：\s 在 /u 模式下涵盖所有 Unicode 空白；额外加 \x{3000} 兜底全角空格
+        $text = preg_replace('/[\s\x{3000}]+/u', ' ', $text);
+        $text = trim($text);
+        // 6) 按汉字数截取
+        if (mb_strlen($text, 'UTF-8') > $maxLen) {
+            $text = mb_substr($text, 0, $maxLen, 'UTF-8');
+        }
+        return $text;
+    }
+
     public static function syncDraft($title, $contentHtml, $sourceUrl, $authorOverride = null)
     {
         self::log("syncDraft 入参: title={$title}, sourceUrl={$sourceUrl}, html长度=" . strlen($contentHtml));
@@ -1221,16 +1264,27 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
             self::log('AppID 前4位: ' . substr($setting->appid, 0, 4) . '***');
 
             // 决定作者：调用方覆盖 > 配置 > Typecho 用户昵称
+            //
+            // 调试帮助：把 $setting->author 的原始值原样打出来。
+            // 如果这里看到的是空、null、或者纯空白，说明配置没读到 —— 去 typecho 后台
+            // 重新保存一次插件配置；如果看到的是预期的名字但 WeChat 草稿仍然不对，
+            // 那就是微信侧的事（公众号名可能盖掉 author 字段，参见微信草稿 API 文档）。
+            self::log('原始 $setting->author = ' . var_export(isset($setting->author) ? $setting->author : null, true));
+            $configuredAuthor = isset($setting->author) ? trim((string)$setting->author) : '';
             if ($authorOverride !== null && $authorOverride !== '') {
                 $author = $authorOverride;
-            } elseif (!empty($setting->author)) {
-                $author = $setting->author;
+                self::log("作者来源: authorOverride 参数");
+            } elseif ($configuredAuthor !== '') {
+                $author = $configuredAuthor;
+                self::log("作者来源: 插件配置 (setting->author)");
             } else {
                 try {
                     $user = Typecho_Widget::widget('Widget_User');
                     $author = $user->screenName;
+                    self::log("作者来源: 当前登录用户 screenName (配置为空时的兜底)");
                 } catch (Exception $e) {
                     $author = '';
+                    self::log("作者来源: 兜底失败，置空", 'WARN');
                 }
             }
             // 微信侧作者字段限 8 个汉字
@@ -1276,12 +1330,18 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
             $mediaId = self::resolveThumbMediaId($originalFirstImg);
             self::log("最终 thumb_media_id: {$mediaId}");
 
+            // 生成摘要：从原始 HTML（不是美化/上传图片后的版本）洗出纯文本，
+            // 保证摘要忠实于作者内容，不会带 beautify 引入的装饰元素。
+            $digest = self::generateDigest($contentHtml, 120);
+            self::log("摘要（" . mb_strlen($digest, 'UTF-8') . " 字）: {$digest}");
+
             self::log('步骤 3/4: 提交草稿到微信...');
             $url = 'https://api.weixin.qq.com/cgi-bin/draft/add?access_token=' . $accessToken;
             $payload = [
                 'articles' => [[
                     'title'              => $title,
                     'author'             => $author,
+                    'digest'             => $digest,
                     'content'            => $html,
                     'content_source_url' => $sourceUrl,
                     'thumb_media_id'     => $mediaId,
