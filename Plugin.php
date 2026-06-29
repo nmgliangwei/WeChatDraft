@@ -1221,7 +1221,8 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
      *   3. strip_tags 剥掉所有 HTML 标签
      *   4. 解 HTML 实体（&nbsp; &amp; &lt; 等还原成字符）
      *   5. 合并所有空白字符（含中文全角空格 U+3000、换行、tab）为单空格
-     *   6. mb_substr 按 UTF-8 字符截取，避免切到半个汉字
+     *   6. mb_substr 按 UTF-8 字符截取，避免切到半个汉字；若窗口内存在句末标点
+     *      （中文 。！？ / 英文 .!?），退回到最后一个句末标点处，保证摘要以完整句子结尾
      *
      * @param string $contentHtml 原始文章 HTML
      * @param int    $maxLen      最大长度（汉字数），默认 120 对齐微信限制
@@ -1245,9 +1246,17 @@ class WeChatDraft_Plugin implements Typecho_Plugin_Interface
         // 5) 空白合并：\s 在 /u 模式下涵盖所有 Unicode 空白；额外加 \x{3000} 兜底全角空格
         $text = preg_replace('/[\s\x{3000}]+/u', ' ', $text);
         $text = trim($text);
-        // 6) 按汉字数截取
+        // 6) 按汉字数截取；如果超长，优先在最后一个句末标点处收尾，避免半截句子。
+        //    中文 。！？ 直接计数；英文 .!? 仅当后面是空白或字符串末尾时才算句末，
+        //    避免把小数点 / 缩写中的点当成句号（"3.14" / "U.S."）
         if (mb_strlen($text, 'UTF-8') > $maxLen) {
             $text = mb_substr($text, 0, $maxLen, 'UTF-8');
+            if (preg_match_all('/[。！？]|[.!?](?=\s|$)/u', $text, $m, PREG_OFFSET_CAPTURE)) {
+                $last = end($m[0]);
+                // PREG_OFFSET_CAPTURE 是字节偏移，而句末标点本身就在 UTF-8 字符边界上，
+                // 在其末尾切字符串不会切到半个字符，可以直接用 substr
+                $text = substr($text, 0, $last[1] + strlen($last[0]));
+            }
         }
         return $text;
     }
